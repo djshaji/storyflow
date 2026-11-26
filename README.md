@@ -6,7 +6,7 @@ bold and italic text, HTML documents, undo and redo, and offline word and phrase
 ## Build on Debian or Ubuntu
 
 ```sh
-sudo apt install build-essential cmake ninja-build pkg-config libgtk-3-dev libxml2-dev libsoup-3.0-dev libjson-glib-dev
+sudo apt install build-essential cmake ninja-build pkg-config libgtk-3-dev libxml2-dev libsoup-3.0-dev libjson-glib-dev libsqlite3-dev
 cmake -S . -B build -G Ninja
 cmake --build build
 ./build/storyflow
@@ -68,3 +68,20 @@ with a GTK accelerator string, for example:
 ```sh
 STORYFLOW_LLAMA_PORT=8081 STORYFLOW_SENTENCE_SHORTCUT='<Control><Shift>space' ./build/storyflow
 ```
+
+## Persistent writing profiles
+
+Choose **Fiction**, **Literary fiction**, **Academic**, or **Personal** from the
+toolbar. StoryFlow learns words and short phrase counts when you save a document
+under the selected profile, and remembers your selection when you reopen the app.
+Each profile keeps its own counts. Re-saving the same path updates that
+document's contribution. Saving a copy under another path creates a separate
+contribution.
+
+**Learning off** is the default. Switch back to it to pause learning and use
+the built-in and current-draft suggestions. Opening a document or dismissing a
+suggestion does not add it to a profile.
+
+StoryFlow keeps the counts and document paths on your machine in
+`${XDG_DATA_HOME:-$HOME/.local/share}/storyflow/profiles.sqlite3`. The database
+stores words and short phrase counts rather than whole manuscripts.

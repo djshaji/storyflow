@@ -13,3 +13,12 @@ public:
 private:
     std::map<std::string, unsigned> frequencies_;
 };
+
+class PhraseCompleter {
+public:
+    explicit PhraseCompleter(std::string_view transitions);
+    std::string continuation(std::string older, std::string recent) const;
+
+private:
+    std::map<std::string, std::string> transitions_;
+};

@@ -1,5 +1,6 @@
 #include "completion.hpp"
 #include "document.hpp"
+#include "sentence.hpp"
 #include "word_data.hpp"
 
 #include <gdk/gdkkeysyms.h>
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,6 +29,7 @@ struct Snapshot {
 struct Editor {
     GtkWidget* window = nullptr;
     GtkWidget* view = nullptr;
+    GtkHeaderBar* header = nullptr;
     GtkTextBuffer* buffer = nullptr;
     GtkWidget* bold_button = nullptr;
     GtkWidget* italic_button = nullptr;
@@ -37,6 +40,13 @@ struct Editor {
     WordCompleter predictor{word_frequencies};
     PhraseCompleter phrases{phrase_transitions};
     std::string suggestion;
+    SentenceClient sentence_client;
+    GCancellable* sentence_request = nullptr;
+    std::shared_ptr<int> lifetime = std::make_shared<int>(0);
+    std::uint64_t sentence_generation = 0;
+    guint sentence_key = GDK_KEY_space;
+    GdkModifierType sentence_modifiers = GDK_CONTROL_MASK;
+    unsigned sentence_port = 8080;
     std::uint64_t revision = 0;
     std::uint64_t saved_revision = 0;
     std::uint64_t next_revision = 0;
@@ -47,6 +57,81 @@ struct Editor {
     bool pending_bold = false;
     bool pending_italic = false;
     int pending_offset = 0;
+
+    Editor() {
+        if (const char* shortcut = g_getenv("STORYFLOW_SENTENCE_SHORTCUT")) {
+            guint key = 0;
+            GdkModifierType modifiers{};
+            gtk_accelerator_parse(shortcut, &key, &modifiers);
+            if (key && (modifiers & (GDK_CONTROL_MASK | GDK_MOD1_MASK | GDK_SUPER_MASK)) &&
+                gtk_accelerator_valid(key, modifiers)) {
+                sentence_key = key;
+                sentence_modifiers = modifiers;
+            }
+        }
+        if (const char* value = g_getenv("STORYFLOW_LLAMA_PORT")) {
+            guint64 port = 0;
+            if (g_ascii_string_to_unsigned(value, 10, 1, 65535, &port, nullptr))
+                sentence_port = static_cast<unsigned>(port);
+        }
+    }
+
+    ~Editor() {
+        lifetime.reset();
+        if (sentence_request)
+            g_cancellable_cancel(sentence_request);
+        g_clear_object(&sentence_request);
+    }
+
+    void cancel_sentence() {
+        ++sentence_generation;
+        if (sentence_request)
+            g_cancellable_cancel(sentence_request);
+        g_clear_object(&sentence_request);
+        gtk_header_bar_set_subtitle(header, nullptr);
+    }
+
+    void request_sentence() {
+        cancel_sentence();
+        set_suggestion({});
+        auto end = cursor();
+        if (gtk_text_buffer_get_has_selection(buffer) || !gtk_text_iter_ends_line(&end)) {
+            gtk_header_bar_set_subtitle(header, "Place the caret at the end of a line");
+            return;
+        }
+        auto start = end;
+        gtk_text_iter_backward_chars(&start, 4096);
+        gchar* raw = gtk_text_buffer_get_text(buffer, &start, &end, TRUE);
+        std::string prompt(raw);
+        g_free(raw);
+        const auto current_paragraph = prompt.rfind("\n\n");
+        if (current_paragraph != std::string::npos && current_paragraph > 0) {
+            const auto earlier_paragraph = prompt.rfind("\n\n", current_paragraph - 1);
+            if (earlier_paragraph != std::string::npos)
+                prompt.erase(0, earlier_paragraph + 2);
+        }
+        if (prompt.find_last_not_of(" \t\r\n") == std::string::npos) {
+            gtk_header_bar_set_subtitle(header, "Write some text first");
+            return;
+        }
+        auto previous = end;
+        const bool after_space = gtk_text_iter_backward_char(&previous) &&
+                                 g_unichar_isspace(gtk_text_iter_get_char(&previous));
+        sentence_request = g_cancellable_new();
+        const auto generation = sentence_generation;
+        gtk_header_bar_set_subtitle(header, "Generating sentence…");
+        sentence_client.request(sentence_port, prompt, sentence_request,
+            [this, alive = std::weak_ptr<int>(lifetime), generation, after_space]
+            (std::string sentence, const std::string& error) {
+                if (alive.expired() || generation != sentence_generation)
+                    return;
+                g_clear_object(&sentence_request);
+                gtk_header_bar_set_subtitle(header, error.empty() ? nullptr : error.c_str());
+                if (after_space && !sentence.empty())
+                    sentence.erase(0, sentence.find_first_not_of(" \t"));
+                set_suggestion(std::move(sentence));
+            });
+    }
 
     void update_title() {
         gchar* basename = filename.empty() ? nullptr : g_filename_display_basename(filename.c_str());
@@ -167,6 +252,7 @@ struct Editor {
 
     void begin_action() {
         if (!restoring) {
+            cancel_sentence();
             in_action = true;
             pending_snapshot = snapshot();
         }
@@ -187,6 +273,7 @@ struct Editor {
     }
 
     void restore(std::vector<Snapshot>& from, std::vector<Snapshot>& to) {
+        cancel_sentence();
         if (from.empty())
             return;
         remember(to, snapshot());
@@ -351,6 +438,7 @@ struct Editor {
     }
 
     void open() {
+        cancel_sentence();
         if (!can_discard())
             return;
         const auto path = choose_file(GTK_FILE_CHOOSER_ACTION_OPEN);
@@ -389,6 +477,14 @@ struct Editor {
 
     gboolean key_press(GdkEventKey* event) {
         const auto modifiers = event->state & gtk_accelerator_get_default_mod_mask();
+        if (modifiers == sentence_modifiers && gdk_keyval_to_lower(event->keyval) == sentence_key) {
+            request_sentence();
+            return TRUE;
+        }
+        if (modifiers == 0 && event->keyval == GDK_KEY_Escape && sentence_request) {
+            cancel_sentence();
+            return TRUE;
+        }
         if (modifiers == GDK_CONTROL_MASK || modifiers == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) {
             const bool shift = modifiers & GDK_SHIFT_MASK;
             switch (gdk_keyval_to_lower(event->keyval)) {
@@ -483,6 +579,7 @@ void activate(GtkApplication* app, gpointer) {
     gtk_window_set_default_size(GTK_WINDOW(editor->window), 850, 650);
 
     auto* header = gtk_header_bar_new();
+    editor->header = GTK_HEADER_BAR(header);
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header), TRUE);
     gtk_header_bar_set_title(GTK_HEADER_BAR(header), "StoryFlow");
     gtk_window_set_titlebar(GTK_WINDOW(editor->window), header);
@@ -537,6 +634,7 @@ void activate(GtkApplication* app, gpointer) {
                 (gtk_text_iter_get_offset(&position) != e->pending_offset ||
                  gtk_text_buffer_get_has_selection(buffer)))
                 e->pending_format = false;
+            e->cancel_sentence();
             e->set_suggestion({});
             e->sync_buttons();
         }), editor);
@@ -552,6 +650,13 @@ void activate(GtkApplication* app, gpointer) {
     g_signal_connect(editor->window, "delete-event",
         G_CALLBACK(+[](GtkWidget*, GdkEvent*, Editor* e) -> gboolean {
             return !e->can_discard();
+        }), editor);
+
+    g_signal_connect(editor->window, "destroy",
+        G_CALLBACK(+[](GtkWidget*, Editor* e) {
+            e->lifetime.reset();
+            if (e->sentence_request)
+                g_cancellable_cancel(e->sentence_request);
         }), editor);
 
     editor->update_title();

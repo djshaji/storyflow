@@ -6,7 +6,7 @@ bold and italic text, HTML documents, undo and redo, and offline word and phrase
 ## Build on Debian or Ubuntu
 
 ```sh
-sudo apt install build-essential cmake ninja-build pkg-config libgtk-3-dev libxml2-dev
+sudo apt install build-essential cmake ninja-build pkg-config libgtk-3-dev libxml2-dev libsoup-3.0-dev libjson-glib-dev
 cmake -S . -B build -G Ninja
 cmake --build build
 ./build/storyflow
@@ -44,3 +44,27 @@ needs twelve occurrences and 30% confidence. Rebuild it with
 `python3 scripts/train_phrases.py gutenberg.zip > data/phrases.tsv`.
 
 See [the implementation plan](docs/Plan.md) for the remaining milestones.
+
+## Local sentence completion
+
+Run llama.cpp's server with a small base GGUF model. Choose a model that fits
+your available RAM.
+
+```sh
+llama-server -m /path/to/base-model.gguf --host 127.0.0.1 --port 8080
+./build/storyflow
+```
+
+At the end of a line, press **Ctrl+Space**. StoryFlow sends up to 4,096
+characters from the current and preceding paragraphs to the loopback server
+and shows the first complete sentence continuation. **Tab** accepts it,
+**Esc** cancels or dismisses it, and **Ctrl+Z** undoes acceptance. Typing or
+moving the caret cancels an outstanding request. Word and phrase completion
+work on their own when the server is stopped.
+
+Set `STORYFLOW_LLAMA_PORT` for a different local port. Override the shortcut
+with a GTK accelerator string, for example:
+
+```sh
+STORYFLOW_LLAMA_PORT=8081 STORYFLOW_SENTENCE_SHORTCUT='<Control><Shift>space' ./build/storyflow
+```

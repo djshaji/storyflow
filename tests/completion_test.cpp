@@ -63,6 +63,32 @@ bool check_editor(Editor& editor) {
     position = anchor;
     gtk_text_iter_backward_char(&anchor);
     gtk_text_buffer_select_range(editor.buffer, &position, &anchor);
+    if (!editor.suggestion.empty())
+        return false;
+
+    gtk_text_buffer_get_end_iter(editor.buffer, &position);
+    gtk_text_buffer_place_cursor(editor.buffer, &position);
+    type(editor, "\nhe shook ");
+    const auto phrase_before = html(editor);
+    if (editor.suggestion != "his head" ||
+        !press(editor, GDK_KEY_Right, GDK_MOD1_MASK) ||
+        editor.suggestion != " head" ||
+        html(editor).find("he shook his</pre>") == std::string::npos ||
+        !press(editor, GDK_KEY_Tab) ||
+        html(editor).find("he shook his head</pre>") == std::string::npos ||
+        !press(editor, GDK_KEY_z, GDK_CONTROL_MASK) ||
+        html(editor).find("he shook his</pre>") == std::string::npos ||
+        !press(editor, GDK_KEY_z, GDK_CONTROL_MASK) || html(editor) != phrase_before)
+        return false;
+
+    type(editor, " ");
+    if (editor.suggestion != "his head" || !press(editor, GDK_KEY_Tab) ||
+        html(editor).find("he shook  his head</pre>") == std::string::npos ||
+        !press(editor, GDK_KEY_z, GDK_CONTROL_MASK))
+        return false;
+
+    type(editor, ".");
+    type(editor, " ");
     return editor.suggestion.empty();
 }
 }
@@ -77,6 +103,14 @@ int main(int argc, char** argv) {
         predictor.suffix("Élo", "Élodie Élodie", "") != "die" ||
         predictor.suffix("Mir", "", "Mirehaven") != "ehaven") {
         g_printerr("Word ranking or case handling failed\n");
+        return 1;
+    }
+
+    const PhraseCompleter phrases{"look\there\nwe look\taway\nlook away\tfrom\naway from\thome\nfrom home\tagain\n"};
+    if (phrases.continuation("We", "look") != "away from home" ||
+        phrases.continuation("they", "look") != "here" ||
+        !phrases.continuation("we", "unknown").empty()) {
+        g_printerr("Phrase backoff or length limit failed\n");
         return 1;
     }
 

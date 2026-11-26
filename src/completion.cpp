@@ -94,3 +94,35 @@ std::string WordCompleter::suffix(std::string_view typed, std::string_view befor
     }
     return ending;
 }
+
+PhraseCompleter::PhraseCompleter(std::string_view transitions) {
+    std::istringstream input{std::string(transitions)};
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto separator = line.find('\t');
+        if (separator != std::string::npos)
+            transitions_.emplace(line.substr(0, separator), line.substr(separator + 1));
+    }
+}
+
+std::string PhraseCompleter::continuation(std::string older, std::string recent) const {
+    if (recent.empty())
+        return {};
+    if (!older.empty())
+        older = lower(older);
+    recent = lower(recent);
+    std::string phrase;
+    for (int length = 0; length < 3; ++length) {
+        auto position = older.empty() ? transitions_.end() : transitions_.find(older + " " + recent);
+        if (position == transitions_.end())
+            position = transitions_.find(recent);
+        if (position == transitions_.end() || position->second == recent)
+            break;
+        if (!phrase.empty())
+            phrase += ' ';
+        phrase += position->second;
+        older = recent;
+        recent = position->second;
+    }
+    return phrase;
+}

@@ -2,3 +2,6 @@
 
 inline constexpr char word_frequencies[] = R"storyflow(
 @STORYFLOW_WORD_FREQUENCIES@)storyflow";
+
+inline constexpr char phrase_transitions[] = R"storyflow(
+@STORYFLOW_PHRASES@)storyflow";

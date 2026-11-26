@@ -46,7 +46,7 @@ WordCompleter::WordCompleter(std::string_view frequencies) {
 }
 
 std::string WordCompleter::suffix(std::string_view typed, std::string_view before,
-                                  std::string_view after) const {
+                                  std::string_view after, const Vocabulary& personal) const {
     if (typed.empty() || g_utf8_strlen(typed.data(), typed.size()) < 3)
         return {};
     const auto prefix = lower(typed);
@@ -66,15 +66,19 @@ std::string WordCompleter::suffix(std::string_view typed, std::string_view befor
             best_frequency = frequency;
         }
     }
-    if (best.empty()) {
-        for (auto it = frequencies_.upper_bound(prefix); it != frequencies_.end() &&
+    const auto rank_prefix = [&](const Vocabulary& vocabulary) {
+        for (auto it = vocabulary.upper_bound(prefix); it != vocabulary.end() &&
              it->first.compare(0, prefix.size(), prefix) == 0; ++it) {
             if (it->second > best_frequency) {
                 best = it->first;
                 best_frequency = it->second;
             }
         }
-    }
+    };
+    if (best.empty())
+        rank_prefix(personal);
+    if (best.empty())
+        rank_prefix(frequencies_);
     if (best.empty())
         return {};
 
@@ -105,7 +109,8 @@ PhraseCompleter::PhraseCompleter(std::string_view transitions) {
     }
 }
 
-std::string PhraseCompleter::continuation(std::string older, std::string recent) const {
+std::string PhraseCompleter::continuation(std::string older, std::string recent,
+                                           const Transitions& personal) const {
     if (recent.empty())
         return {};
     if (!older.empty())
@@ -113,16 +118,57 @@ std::string PhraseCompleter::continuation(std::string older, std::string recent)
     recent = lower(recent);
     std::string phrase;
     for (int length = 0; length < 3; ++length) {
-        auto position = older.empty() ? transitions_.end() : transitions_.find(older + " " + recent);
-        if (position == transitions_.end())
-            position = transitions_.find(recent);
-        if (position == transitions_.end() || position->second == recent)
+        const auto next_for = [&](const std::string& context) -> std::string {
+            if (const auto found = personal.find(context); found != personal.end())
+                return found->second;
+            const auto found = transitions_.find(context);
+            return found == transitions_.end() ? std::string{} : found->second;
+        };
+        auto next = older.empty() ? std::string{} : next_for(older + " " + recent);
+        if (next.empty())
+            next = next_for(recent);
+        if (next.empty() || next == recent)
             break;
         if (!phrase.empty())
             phrase += ' ';
-        phrase += position->second;
+        phrase += next;
         older = recent;
-        recent = position->second;
+        recent = std::move(next);
     }
     return phrase;
+}
+
+
+WritingStatistics writing_statistics(std::string_view text) {
+    WritingStatistics result;
+    if (text.empty())
+        return result;
+    std::string older, recent;
+    const char* position = text.data();
+    const char* end = position + text.size();
+    while (position < end) {
+        const auto character = g_utf8_get_char(position);
+        if (!continues_word(character)) {
+            if (character != ' ') {
+                older.clear();
+                recent.clear();
+            }
+            position = g_utf8_next_char(position);
+            continue;
+        }
+        const char* start = position;
+        do {
+            position = g_utf8_next_char(position);
+        } while (position < end && continues_word(g_utf8_get_char(position)));
+        auto word = lower({start, static_cast<std::size_t>(position - start)});
+        if (g_utf8_strlen(word.c_str(), -1) >= 4)
+            ++result.words[word];
+        if (!recent.empty())
+            ++result.phrases[{recent, word}];
+        if (!older.empty())
+            ++result.phrases[{older + " " + recent, word}];
+        older = std::move(recent);
+        recent = std::move(word);
+    }
+    return result;
 }

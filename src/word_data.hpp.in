@@ -1,0 +1,4 @@
+#pragma once
+
+inline constexpr char word_frequencies[] = R"storyflow(
+@STORYFLOW_WORD_FREQUENCIES@)storyflow";

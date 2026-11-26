@@ -1,12 +1,14 @@
 #include "completion.hpp"
 #include "document.hpp"
 #include "sentence.hpp"
+#include "profiles.hpp"
 #include "word_data.hpp"
 
 #include <gdk/gdkkeysyms.h>
 #include <gio/gio.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -17,6 +19,20 @@ namespace {
 
 bool continues_word(gunichar character) {
     return g_unichar_isalpha(character) || g_unichar_ismark(character);
+}
+
+constexpr std::array<const char*, 4> writing_profiles{
+    "Fiction", "Literary fiction", "Academic", "Personal"
+};
+
+std::string journal_path() {
+    gchar* directory = g_build_filename(g_get_user_data_dir(), "storyflow", nullptr);
+    g_mkdir_with_parents(directory, 0700);
+    gchar* filename = g_build_filename(directory, "profiles.sqlite3", nullptr);
+    std::string path(filename);
+    g_free(filename);
+    g_free(directory);
+    return path;
 }
 
 struct Snapshot {
@@ -33,6 +49,10 @@ struct Editor {
     GtkTextBuffer* buffer = nullptr;
     GtkWidget* bold_button = nullptr;
     GtkWidget* italic_button = nullptr;
+    ProfileStore profiles{journal_path()};
+    std::string active_profile;
+    Vocabulary profile_words;
+    Transitions profile_phrases;
     std::string filename;
     Snapshot pending_snapshot;
     std::vector<Snapshot> undo_stack;
@@ -133,6 +153,37 @@ struct Editor {
             });
     }
 
+    void load_profile() {
+        if (active_profile.empty()) {
+            profile_words.clear();
+            profile_phrases.clear();
+        } else if (!profiles.load(active_profile, profile_words, profile_phrases)) {
+            gtk_header_bar_set_subtitle(header, "Could not load writing profile");
+        }
+    }
+
+    void change_profile(const char* profile) {
+        cancel_sentence();
+        set_suggestion({});
+        active_profile = profile ? profile : "";
+        load_profile();
+        if (!profiles.select(active_profile))
+            gtk_header_bar_set_subtitle(header, "Could not save profile selection");
+        gtk_widget_grab_focus(view);
+    }
+
+    void learn_saved_document(const std::string& path, const Document& document) {
+        if (active_profile.empty())
+            return;
+        std::string text;
+        for (const auto& run : document)
+            text += run.text;
+        if (profiles.learn(active_profile, path, writing_statistics(text)))
+            load_profile();
+        else
+            gtk_header_bar_set_subtitle(header, "Story saved, but profile learning failed");
+    }
+
     void update_title() {
         gchar* basename = filename.empty() ? nullptr : g_filename_display_basename(filename.c_str());
         const std::string title = std::string(basename ? basename : "Untitled") +
@@ -210,7 +261,7 @@ struct Editor {
         if (recent.empty())
             return {};
         auto older = read_previous(end);
-        return phrases.continuation(std::move(older), std::move(recent));
+        return phrases.continuation(std::move(older), std::move(recent), profile_phrases);
     }
 
     void predict() {
@@ -238,7 +289,7 @@ struct Editor {
         gchar* prefix = gtk_text_buffer_get_text(buffer, &start, &end, TRUE);
         gchar* before = gtk_text_buffer_get_text(buffer, &document_start, &start, TRUE);
         gchar* after = gtk_text_buffer_get_text(buffer, &end, &document_end, TRUE);
-        set_suggestion(predictor.suffix(prefix, before, after));
+        set_suggestion(predictor.suffix(prefix, before, after, profile_words));
         g_free(prefix);
         g_free(before);
         g_free(after);
@@ -407,7 +458,8 @@ struct Editor {
         const auto path = save_as || filename.empty() ? choose_file(GTK_FILE_CHOOSER_ACTION_SAVE) : filename;
         if (path.empty())
             return false;
-        const auto html = to_html(read_buffer(buffer));
+        const auto document = read_buffer(buffer);
+        const auto html = to_html(document);
         GError* error = nullptr;
         auto* file = g_file_new_for_path(path.c_str());
         const bool saved = g_file_replace_contents(file, html.data(), html.size(), nullptr, FALSE,
@@ -421,6 +473,7 @@ struct Editor {
         filename = path;
         saved_revision = revision;
         update_title();
+        learn_saved_document(path, document);
         return true;
     }
 
@@ -593,6 +646,24 @@ void activate(GtkApplication* app, gpointer) {
     editor->italic_button = gtk_toggle_button_new_with_label("Italic");
     gtk_header_bar_pack_end(GTK_HEADER_BAR(header), editor->italic_button);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(header), editor->bold_button);
+
+    auto* profiles = gtk_combo_box_text_new();
+    auto* profile_combo = GTK_COMBO_BOX_TEXT(profiles);
+    gtk_widget_set_tooltip_text(profiles, "Writing profile for vocabulary and phrase learning");
+    gtk_combo_box_text_append(profile_combo, "", "Learning off");
+    for (const auto* name : writing_profiles)
+        gtk_combo_box_text_append(profile_combo, name, name);
+    const auto selected = editor->profiles.selected();
+    if (gtk_combo_box_set_active_id(GTK_COMBO_BOX(profiles), selected.c_str()))
+        editor->active_profile = selected;
+    else
+        gtk_combo_box_set_active(GTK_COMBO_BOX(profiles), 0);
+    editor->load_profile();
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(header), profiles);
+    g_signal_connect(profiles, "changed",
+        G_CALLBACK(+[](GtkComboBox* combo, Editor* e) {
+            e->change_profile(gtk_combo_box_get_active_id(combo));
+        }), editor);
 
     auto* scroll = gtk_scrolled_window_new(nullptr, nullptr);
     editor->view = gtk_text_view_new();

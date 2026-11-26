@@ -2,6 +2,7 @@
 #include "document.hpp"
 #include "sentence.hpp"
 #include "profiles.hpp"
+#include "project.hpp"
 #include "word_data.hpp"
 
 #include <gdk/gdkkeysyms.h>
@@ -11,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,6 +51,8 @@ struct Editor {
     GtkTextBuffer* buffer = nullptr;
     GtkWidget* bold_button = nullptr;
     GtkWidget* italic_button = nullptr;
+    StoryProject project;
+    Vocabulary project_names;
     ProfileStore profiles{journal_path()};
     std::string active_profile;
     Vocabulary profile_words;
@@ -140,7 +144,7 @@ struct Editor {
         sentence_request = g_cancellable_new();
         const auto generation = sentence_generation;
         gtk_header_bar_set_subtitle(header, "Generating sentence…");
-        sentence_client.request(sentence_port, prompt, sentence_request,
+        sentence_client.request(sentence_port, project.sentence_prompt(prompt), sentence_request,
             [this, alive = std::weak_ptr<int>(lifetime), generation, after_space]
             (std::string sentence, const std::string& error) {
                 if (alive.expired() || generation != sentence_generation)
@@ -289,7 +293,10 @@ struct Editor {
         gchar* prefix = gtk_text_buffer_get_text(buffer, &start, &end, TRUE);
         gchar* before = gtk_text_buffer_get_text(buffer, &document_start, &start, TRUE);
         gchar* after = gtk_text_buffer_get_text(buffer, &end, &document_end, TRUE);
-        set_suggestion(predictor.suffix(prefix, before, after, profile_words));
+        static const WordCompleter project_completer{""};
+        auto name = project_completer.suffix(prefix, "", "", project_names);
+        set_suggestion(name.empty() ? predictor.suffix(prefix, before, after, profile_words)
+                                    : std::move(name));
         g_free(prefix);
         g_free(before);
         g_free(after);
@@ -425,20 +432,29 @@ struct Editor {
         gtk_widget_destroy(dialog);
     }
 
-    std::string choose_file(GtkFileChooserAction action) {
+    std::string choose_file(GtkFileChooserAction action, bool project_file = false) {
         const bool saving = action == GTK_FILE_CHOOSER_ACTION_SAVE;
-        auto* dialog = gtk_file_chooser_dialog_new(saving ? "Save Story" : "Open Story",
+        auto* dialog = gtk_file_chooser_dialog_new(
+            project_file ? (saving ? "Save Project" : "Open Project")
+                         : (saving ? "Save Story" : "Open Story"),
             GTK_WINDOW(window), action, "_Cancel", GTK_RESPONSE_CANCEL,
             saving ? "_Save" : "_Open", GTK_RESPONSE_ACCEPT, nullptr);
         auto* chooser = GTK_FILE_CHOOSER(dialog);
         auto* filter = gtk_file_filter_new();
-        gtk_file_filter_set_name(filter, "HTML documents");
-        gtk_file_filter_add_pattern(filter, "*.html");
-        gtk_file_filter_add_pattern(filter, "*.htm");
+        if (project_file) {
+            gtk_file_filter_set_name(filter, "StoryFlow projects");
+            gtk_file_filter_add_pattern(filter, "*.storyflow");
+        } else {
+            gtk_file_filter_set_name(filter, "HTML documents");
+            gtk_file_filter_add_pattern(filter, "*.html");
+            gtk_file_filter_add_pattern(filter, "*.htm");
+        }
         gtk_file_chooser_add_filter(chooser, filter);
         if (saving) {
             gtk_file_chooser_set_do_overwrite_confirmation(chooser, TRUE);
-            if (filename.empty())
+            if (project_file)
+                gtk_file_chooser_set_current_name(chooser, "Untitled.storyflow");
+            else if (filename.empty())
                 gtk_file_chooser_set_current_name(chooser, "Untitled.html");
             else
                 gtk_file_chooser_set_filename(chooser, filename.c_str());
@@ -495,22 +511,30 @@ struct Editor {
         if (!can_discard())
             return;
         const auto path = choose_file(GTK_FILE_CHOOSER_ACTION_OPEN);
-        if (path.empty())
-            return;
+        if (!path.empty() && open_document(path)) {
+            const auto canonical = project.chapter_path(path);
+            const bool listed = std::any_of(project.chapters.begin(), project.chapters.end(),
+                [&](const auto& chapter) { return project.chapter_path(chapter) == canonical; });
+            if (!listed)
+                set_project({});
+        }
+    }
+
+    bool open_document(const std::string& path) {
         gchar* text = nullptr;
         gsize length = 0;
         GError* error = nullptr;
         if (!g_file_get_contents(path.c_str(), &text, &length, &error)) {
             show_error("Could not open the story", error->message);
             g_error_free(error);
-            return;
+            return false;
         }
         Document document;
         const bool parsed = from_html(std::string(text, length), document);
         g_free(text);
         if (!parsed) {
             show_error("Could not open the story", "Choose a UTF-8 HTML document.");
-            return;
+            return false;
         }
         restoring = true;
         pending_format = false;
@@ -526,6 +550,161 @@ struct Editor {
         set_suggestion({});
         sync_buttons();
         update_title();
+        return true;
+    }
+
+    void set_project(StoryProject next) {
+        cancel_sentence();
+        set_suggestion({});
+        project = std::move(next);
+        project_names = project.names();
+        gchar* title = project.path.empty() ? nullptr : g_filename_display_basename(project.path.c_str());
+        gtk_header_bar_set_title(header, title ? title : "StoryFlow");
+        g_free(title);
+    }
+
+    void open_project() {
+        const auto path = choose_file(GTK_FILE_CHOOSER_ACTION_OPEN, true);
+        if (path.empty())
+            return;
+        StoryProject next;
+        GError* error = nullptr;
+        if (!StoryProject::read(path, next, &error)) {
+            show_error("Could not open the project", error->message);
+            g_error_free(error);
+            return;
+        }
+        if (!can_discard())
+            return;
+        if (!next.chapters.empty()) {
+            if (!open_document(next.chapter_path(next.chapters.front())))
+                return;
+        } else {
+            clear_document();
+        }
+        set_project(std::move(next));
+    }
+
+    void clear_document() {
+        restoring = true;
+        pending_format = false;
+        write_buffer(buffer, {});
+        restoring = false;
+        filename.clear();
+        undo_stack.clear();
+        redo_stack.clear();
+        revision = saved_revision = ++next_revision;
+        sync_buttons();
+        update_title();
+    }
+
+    void choose_chapter() {
+        if (project.chapters.empty()) {
+            show_error("No chapters in this project", "Add HTML chapter paths in Project → Edit Project.");
+            return;
+        }
+        auto* dialog = gtk_dialog_new_with_buttons("Open Chapter", GTK_WINDOW(window),
+            GTK_DIALOG_MODAL, "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, nullptr);
+        auto* chapters = GTK_COMBO_BOX_TEXT(gtk_combo_box_text_new());
+        gtk_container_add(GTK_CONTAINER(gtk_dialog_get_content_area(GTK_DIALOG(dialog))), GTK_WIDGET(chapters));
+        int selected = 0;
+        for (std::size_t i = 0; i < project.chapters.size(); ++i) {
+            const auto& chapter = project.chapters[i];
+            gtk_combo_box_text_append_text(chapters, chapter.c_str());
+            if (project.chapter_path(chapter) == filename)
+                selected = static_cast<int>(i);
+        }
+        gtk_combo_box_set_active(GTK_COMBO_BOX(chapters), selected);
+        gtk_widget_show_all(dialog);
+        const bool accepted = gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT;
+        const auto index = gtk_combo_box_get_active(GTK_COMBO_BOX(chapters));
+        gtk_widget_destroy(dialog);
+        if (accepted && index >= 0 && can_discard()) {
+            cancel_sentence();
+            open_document(project.chapter_path(project.chapters[index]));
+        }
+    }
+
+    void edit_project(bool create) {
+        auto next = create ? StoryProject{} : project;
+        if (next.path.empty()) {
+            next.path = choose_file(GTK_FILE_CHOOSER_ACTION_SAVE, true);
+            if (next.path.empty())
+                return;
+        }
+        auto* dialog = gtk_dialog_new_with_buttons("Story Project", GTK_WINDOW(window),
+            GTK_DIALOG_MODAL, "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, nullptr);
+        gtk_window_set_default_size(GTK_WINDOW(dialog), 620, 540);
+        auto* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+        gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+        gtk_box_set_spacing(GTK_BOX(content), 8);
+        const auto section = [&](const char* label, const std::string& text) {
+            auto* caption = gtk_label_new(label);
+            gtk_widget_set_halign(caption, GTK_ALIGN_START);
+            gtk_box_pack_start(GTK_BOX(content), caption, FALSE, FALSE, 0);
+            auto* scroll = gtk_scrolled_window_new(nullptr, nullptr);
+            auto* field = gtk_text_view_new();
+            auto* field_view = GTK_TEXT_VIEW(field);
+            gtk_text_view_set_wrap_mode(field_view, GTK_WRAP_WORD_CHAR);
+            auto* field_buffer = gtk_text_view_get_buffer(field_view);
+            gtk_text_buffer_set_text(field_buffer, text.c_str(), -1);
+            gtk_container_add(GTK_CONTAINER(scroll), field);
+            gtk_box_pack_start(GTK_BOX(content), scroll, TRUE, TRUE, 0);
+            return field_buffer;
+        };
+        std::string chapter_list;
+        for (const auto& chapter : next.chapters)
+            chapter_list += chapter + "\n";
+        if (create && !filename.empty())
+            chapter_list = filename + "\n";
+        auto* chapters = section("Chapter paths, one HTML file per line in reading order", chapter_list);
+        auto* add = gtk_button_new_with_label("Add HTML Chapter…");
+        gtk_widget_set_halign(add, GTK_ALIGN_START);
+        gtk_box_pack_start(GTK_BOX(content), add, FALSE, FALSE, 0);
+        g_object_set_data(G_OBJECT(add), "chapters", chapters);
+        g_signal_connect(add, "clicked", G_CALLBACK(+[](GtkButton* button, Editor* editor) {
+            const auto path = editor->choose_file(GTK_FILE_CHOOSER_ACTION_OPEN);
+            if (path.empty())
+                return;
+            auto* field = GTK_TEXT_BUFFER(g_object_get_data(G_OBJECT(button), "chapters"));
+            GtkTextIter end;
+            gtk_text_buffer_get_end_iter(field, &end);
+            if (!gtk_text_iter_starts_line(&end))
+                gtk_text_buffer_insert(field, &end, "\n", -1);
+            gtk_text_buffer_insert(field, &end, (path + "\n").c_str(), -1);
+        }), this);
+        auto* cast = section("Characters, one per line (Name | Alias: notes)", next.characters);
+        auto* location = section("Scene location", next.location);
+        auto* summary = section("Scene summary", next.summary);
+        const auto text = [](GtkTextBuffer* field) {
+            GtkTextIter start, end;
+            gtk_text_buffer_get_bounds(field, &start, &end);
+            gchar* value = gtk_text_buffer_get_text(field, &start, &end, TRUE);
+            std::string result(value);
+            g_free(value);
+            return result;
+        };
+        gtk_widget_show_all(dialog);
+        while (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+            next.chapters.clear();
+            std::istringstream paths(text(chapters));
+            std::string chapter;
+            while (std::getline(paths, chapter)) {
+                if (!chapter.empty())
+                    next.chapters.push_back(chapter);
+            }
+            next.characters = text(cast);
+            next.location = text(location);
+            next.summary = text(summary);
+            GError* error = nullptr;
+            if (next.save(&error)) {
+                set_project(std::move(next));
+                break;
+            }
+            show_error("Could not save the project", error->message);
+            g_error_free(error);
+        }
+        gtk_widget_destroy(dialog);
     }
 
     gboolean key_press(GdkEventKey* event) {
@@ -642,6 +821,24 @@ void activate(GtkApplication* app, gpointer) {
     auto* save_as = gtk_button_new_with_label("Save As");
     for (auto* button : {open, save, save_as})
         gtk_header_bar_pack_start(GTK_HEADER_BAR(header), button);
+    auto* project_menu = gtk_menu_button_new();
+    gtk_button_set_label(GTK_BUTTON(project_menu), "Project");
+    auto* items = gtk_menu_new();
+    auto add_project_item = [&](const char* label, GCallback action) {
+        auto* item = gtk_menu_item_new_with_label(label);
+        gtk_menu_shell_append(GTK_MENU_SHELL(items), item);
+        g_signal_connect(item, "activate", action, editor);
+    };
+    add_project_item("New Project", G_CALLBACK(+[](GtkMenuItem*, Editor* e) { e->edit_project(true); }));
+    add_project_item("Open Project", G_CALLBACK(+[](GtkMenuItem*, Editor* e) { e->open_project(); }));
+    add_project_item("Open Chapter", G_CALLBACK(+[](GtkMenuItem*, Editor* e) { e->choose_chapter(); }));
+    add_project_item("Edit Project", G_CALLBACK(+[](GtkMenuItem*, Editor* e) {
+        e->edit_project(e->project.path.empty());
+    }));
+    add_project_item("Close Project", G_CALLBACK(+[](GtkMenuItem*, Editor* e) { e->set_project({}); }));
+    gtk_widget_show_all(items);
+    gtk_menu_button_set_popup(GTK_MENU_BUTTON(project_menu), items);
+    gtk_header_bar_pack_start(GTK_HEADER_BAR(header), project_menu);
     editor->bold_button = gtk_toggle_button_new_with_label("Bold");
     editor->italic_button = gtk_toggle_button_new_with_label("Italic");
     gtk_header_bar_pack_end(GTK_HEADER_BAR(header), editor->italic_button);

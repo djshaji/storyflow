@@ -3,6 +3,7 @@ project(StoryFlow LANGUAGES CXX)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
+pkg_check_modules(SENTENCE REQUIRED IMPORTED_TARGET libsoup-3.0 json-glib-1.0)
 find_package(LibXml2 REQUIRED)
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS data/word-frequencies.tsv data/phrases.tsv)
@@ -10,10 +11,10 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/data/word-frequencies.tsv" STORYFLOW_WORD
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/data/phrases.tsv" STORYFLOW_PHRASES)
 configure_file(src/word_data.hpp.in generated/word_data.hpp @ONLY)
 
-add_library(storyflow_completion src/completion.cpp)
+add_library(storyflow_completion src/completion.cpp src/sentence.cpp)
 target_compile_features(storyflow_completion PUBLIC cxx_std_17)
 target_include_directories(storyflow_completion PUBLIC src "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(storyflow_completion PUBLIC PkgConfig::GTK)
+target_link_libraries(storyflow_completion PUBLIC PkgConfig::GTK PkgConfig::SENTENCE)
 target_compile_options(storyflow_completion PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(storyflow src/main.cpp src/document.cpp)

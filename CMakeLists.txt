@@ -5,8 +5,9 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
 find_package(LibXml2 REQUIRED)
 
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS data/word-frequencies.tsv)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS data/word-frequencies.tsv data/phrases.tsv)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/data/word-frequencies.tsv" STORYFLOW_WORD_FREQUENCIES)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/data/phrases.tsv" STORYFLOW_PHRASES)
 configure_file(src/word_data.hpp.in generated/word_data.hpp @ONLY)
 
 add_library(storyflow_completion src/completion.cpp)

@@ -22,6 +22,102 @@ std::string html(Editor& editor) {
     return to_html(read_buffer(editor.buffer));
 }
 
+bool wait_for(const std::function<bool()>& done) {
+    const auto deadline = g_get_monotonic_time() + G_TIME_SPAN_SECOND * 3;
+    while (!done() && g_get_monotonic_time() < deadline) {
+        while (g_main_context_iteration(nullptr, FALSE)) {}
+        g_usleep(1000);
+    }
+    return done();
+}
+
+struct MockServer {
+    int replies = 0;
+    bool received_prompt = false;
+};
+
+void handle_sentence(SoupServer*, SoupServerMessage* message, const char*,
+                     GHashTable*, gpointer data) {
+    auto* mock = static_cast<MockServer*>(data);
+    auto* bytes = soup_message_body_flatten(soup_server_message_get_request_body(message));
+    gsize length = 0;
+    const auto* raw = static_cast<const char*>(g_bytes_get_data(bytes, &length));
+    mock->received_prompt = std::string_view(raw, length).find("The lamp was") != std::string::npos;
+    g_bytes_unref(bytes);
+    const char response[] = "{\"content\":\" dim. The second sentence.\"}";
+    soup_server_message_set_status(message, SOUP_STATUS_OK, nullptr);
+    soup_server_message_set_response(message, "application/json", SOUP_MEMORY_COPY,
+                                     response, sizeof(response) - 1);
+    soup_server_message_pause(message);
+    using Reply = std::pair<MockServer*, SoupServerMessage*>;
+    g_timeout_add_full(G_PRIORITY_DEFAULT, 50, +[](gpointer payload) -> gboolean {
+        auto* reply = static_cast<Reply*>(payload);
+        ++reply->first->replies;
+        soup_server_message_unpause(reply->second);
+        return G_SOURCE_REMOVE;
+    }, new Reply{mock, SOUP_SERVER_MESSAGE(g_object_ref(message))}, +[](gpointer payload) {
+        auto* reply = static_cast<Reply*>(payload);
+        g_object_unref(reply->second);
+        delete reply;
+    });
+}
+
+bool check_sentences(Editor& editor) {
+    MockServer mock;
+    auto* server = soup_server_new(nullptr, nullptr);
+    auto* address = g_inet_address_new_loopback(G_SOCKET_FAMILY_IPV4);
+    auto* socket = g_inet_socket_address_new(address, 0);
+    g_object_unref(address);
+    const bool listening = soup_server_listen(server, socket, static_cast<SoupServerListenOptions>(0),
+                                             nullptr);
+    g_object_unref(socket);
+    if (!listening) {
+        g_object_unref(server);
+        return false;
+    }
+    auto* uris = soup_server_get_uris(server);
+    editor.sentence_port = g_uri_get_port(static_cast<GUri*>(uris->data));
+    g_slist_free_full(uris, +[](gpointer uri) { g_uri_unref(static_cast<GUri*>(uri)); });
+    soup_server_add_handler(server, "/completion", handle_sentence, &mock, nullptr);
+    auto end = editor.cursor();
+    gtk_text_buffer_get_end_iter(editor.buffer, &end);
+    gtk_text_buffer_place_cursor(editor.buffer, &end);
+    type(editor, "\n\nThe lamp was");
+    const auto before = html(editor);
+    bool passed = press(editor, GDK_KEY_space, GDK_CONTROL_MASK) &&
+                  wait_for([&] { return !editor.sentence_request; }) &&
+                  mock.received_prompt && editor.suggestion == " dim." && html(editor) == before &&
+                  press(editor, GDK_KEY_Tab) && html(editor).find("The lamp was dim.") != std::string::npos &&
+                  press(editor, GDK_KEY_z, GDK_CONTROL_MASK) && html(editor) == before;
+
+    for (int attempt = 0; passed && attempt < 3; ++attempt) {
+        const auto previous_replies = mock.replies;
+        mock.received_prompt = false;
+        passed = press(editor, GDK_KEY_space, GDK_CONTROL_MASK) &&
+                 wait_for([&] { return mock.received_prompt; });
+        if (!passed)
+            break;
+        if (attempt == 0) {
+            auto caret = editor.cursor();
+            gtk_text_iter_backward_char(&caret);
+            gtk_text_buffer_place_cursor(editor.buffer, &caret);
+        } else if (attempt == 1) {
+            type(editor, "x");
+        } else {
+            passed = press(editor, GDK_KEY_Escape);
+        }
+        passed = wait_for([&] { return mock.replies > previous_replies; }) &&
+                 passed && !editor.sentence_request && editor.suggestion != " dim.";
+        gtk_text_buffer_get_end_iter(editor.buffer, &end);
+        gtk_text_buffer_place_cursor(editor.buffer, &end);
+    }
+
+    editor.cancel_sentence();
+    soup_server_disconnect(server);
+    g_object_unref(server);
+    return passed;
+}
+
 bool check_editor(Editor& editor) {
     type(editor, "whis");
     const auto before = html(editor);
@@ -122,7 +218,7 @@ int main(int argc, char** argv) {
     activate(app, nullptr);
     auto* window = GTK_WINDOW(gtk_application_get_windows(app)->data);
     auto* editor = static_cast<Editor*>(g_object_get_data(G_OBJECT(window), "editor"));
-    const bool passed = check_editor(*editor);
+    const bool passed = check_editor(*editor) && check_sentences(*editor);
     if (!passed)
         g_printerr("Editor completion interaction failed\n");
     gtk_widget_destroy(GTK_WIDGET(window));

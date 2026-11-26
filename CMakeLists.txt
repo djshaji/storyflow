@@ -12,7 +12,7 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/data/word-frequencies.tsv" STORYFLOW_WORD
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/data/phrases.tsv" STORYFLOW_PHRASES)
 configure_file(src/word_data.hpp.in generated/word_data.hpp @ONLY)
 
-add_library(storyflow_completion src/completion.cpp src/sentence.cpp src/profiles.cpp)
+add_library(storyflow_completion src/completion.cpp src/sentence.cpp src/profiles.cpp src/project.cpp)
 target_compile_features(storyflow_completion PUBLIC cxx_std_17)
 target_include_directories(storyflow_completion PUBLIC src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(storyflow_completion PUBLIC PkgConfig::GTK PkgConfig::SENTENCE SQLite::SQLite3)
@@ -38,6 +38,9 @@ if(BUILD_TESTING)
     add_executable(profile_test tests/profile_test.cpp)
     target_link_libraries(profile_test PRIVATE storyflow_completion)
     add_test(NAME writing_profiles COMMAND profile_test)
+    add_executable(project_test tests/project_test.cpp)
+    target_link_libraries(project_test PRIVATE storyflow_completion)
+    add_test(NAME story_projects COMMAND project_test)
     set_tests_properties(word_completion PROPERTIES
         ENVIRONMENT "XDG_DATA_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-data")
 endif()

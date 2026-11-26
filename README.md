@@ -85,3 +85,23 @@ suggestion does not add it to a profile.
 StoryFlow keeps the counts and document paths on your machine in
 `${XDG_DATA_HOME:-$HOME/.local/share}/storyflow/profiles.sqlite3`. The database
 stores words and short phrase counts rather than whole manuscripts.
+
+## Story projects
+
+Use **Project → New Project** to create a `.storyflow` file. Add existing
+HTML chapters with **Add HTML Chapter…**. Drag-select and edit the chapter
+paths to put them in reading order. Relative paths resolve from the project
+file's directory. **Project → Open Chapter** switches between the listed
+drafts. The project file stores chapter references and notes, and each chapter
+is saved separately as HTML.
+
+In **Edit Project**, put one character per line using
+`Mirehaven | Mira: The archivist knows where the map is hidden.`
+Enter the current location and a scene summary in the same dialog. Notes
+apply to the entire active project, so update them when you change scenes.
+
+Character names and aliases get first priority in word completion. When you
+request a sentence with **Ctrl+Space**, StoryFlow sends the scene notes,
+up to three character notes matched against recent prose or the summary,
+and the recent prose to your local llama.cpp server. **Close Project** returns
+to ordinary completion and keeps the current document open.

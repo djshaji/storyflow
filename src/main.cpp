@@ -35,6 +35,7 @@ struct Editor {
     std::vector<Snapshot> undo_stack;
     std::vector<Snapshot> redo_stack;
     WordCompleter predictor{word_frequencies};
+    PhraseCompleter phrases{phrase_transitions};
     std::string suggestion;
     std::uint64_t revision = 0;
     std::uint64_t saved_revision = 0;
@@ -93,6 +94,40 @@ struct Editor {
         gtk_widget_queue_draw(view);
     }
 
+    static GtkTextIter word_start(GtkTextIter end) {
+        GtkTextIter previous = end;
+        while (gtk_text_iter_backward_char(&previous) &&
+               continues_word(gtk_text_iter_get_char(&previous)))
+            end = previous;
+        return end;
+    }
+
+    std::string phrase_at(GtkTextIter end) const {
+        auto read_previous = [this](GtkTextIter& position) {
+            const auto boundary = position;
+            GtkTextIter previous = position;
+            while (gtk_text_iter_backward_char(&previous) &&
+                   gtk_text_iter_get_char(&previous) == ' ')
+                position = previous;
+            if (gtk_text_iter_equal(&position, &boundary) ||
+                !gtk_text_iter_backward_char(&position) ||
+                !continues_word(gtk_text_iter_get_char(&position)))
+                return std::string{};
+            gtk_text_iter_forward_char(&position);
+            const auto start = word_start(position);
+            gchar* text = gtk_text_buffer_get_text(buffer, &start, &position, TRUE);
+            std::string word(text);
+            g_free(text);
+            position = start;
+            return word;
+        };
+        auto recent = read_previous(end);
+        if (recent.empty())
+            return {};
+        auto older = read_previous(end);
+        return phrases.continuation(std::move(older), std::move(recent));
+    }
+
     void predict() {
         const GtkTextIter end = cursor();
         if (gtk_text_buffer_get_has_selection(buffer) ||
@@ -101,11 +136,13 @@ struct Editor {
             return;
         }
 
-        GtkTextIter start = end;
-        GtkTextIter previous = start;
-        while (gtk_text_iter_backward_char(&previous) &&
-               continues_word(gtk_text_iter_get_char(&previous)))
-            start = previous;
+        auto previous = end;
+        if (gtk_text_iter_backward_char(&previous) && gtk_text_iter_get_char(&previous) == ' ') {
+            set_suggestion(phrase_at(end));
+            return;
+        }
+
+        const auto start = word_start(end);
         if (gtk_text_iter_get_offset(&end) - gtk_text_iter_get_offset(&start) < 3) {
             set_suggestion({});
             return;
@@ -210,8 +247,16 @@ struct Editor {
         pending_offset = offset;
     }
 
-    void accept() {
-        const auto accepted = suggestion;
+    void accept(bool word_only) {
+        auto accepted = suggestion;
+        std::string remainder;
+        if (word_only) {
+            const auto boundary = accepted.find(' ', accepted.find_first_not_of(' '));
+            if (boundary != std::string::npos) {
+                remainder = accepted.substr(boundary);
+                accepted.erase(boundary);
+            }
+        }
         const auto position = cursor();
         GtkTextIter previous = position;
         gtk_text_iter_backward_char(&previous);
@@ -231,7 +276,7 @@ struct Editor {
         if (italic)
             gtk_text_buffer_apply_tag_by_name(buffer, "italic", &start, &end);
         gtk_text_buffer_end_user_action(buffer);
-        set_suggestion({});
+        set_suggestion(std::move(remainder));
     }
 
     void show_error(const char* heading, const char* detail) {
@@ -368,11 +413,11 @@ struct Editor {
                 return TRUE;
             }
             if (modifiers == 0 && event->keyval == GDK_KEY_Tab) {
-                accept();
+                accept(false);
                 return TRUE;
             }
             if (modifiers == GDK_MOD1_MASK && event->keyval == GDK_KEY_Right) {
-                accept();
+                accept(true);
                 return TRUE;
             }
         }

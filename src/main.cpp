@@ -1,8 +1,11 @@
+#include "completion.hpp"
 #include "document.hpp"
+#include "word_data.hpp"
 
 #include <gdk/gdkkeysyms.h>
 #include <gio/gio.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -10,15 +13,9 @@
 
 namespace {
 
-struct MockPredictor {
-    std::string suggest(const std::string& prefix) const {
-        static const std::string trigger = "The door";
-        if (prefix.size() >= trigger.size() &&
-            prefix.compare(prefix.size() - trigger.size(), trigger.size(), trigger) == 0)
-            return " creaked open.";
-        return {};
-    }
-};
+bool continues_word(gunichar character) {
+    return g_unichar_isalpha(character) || g_unichar_ismark(character);
+}
 
 struct Snapshot {
     Document document;
@@ -37,7 +34,7 @@ struct Editor {
     Snapshot pending_snapshot;
     std::vector<Snapshot> undo_stack;
     std::vector<Snapshot> redo_stack;
-    MockPredictor predictor;
+    WordCompleter predictor{word_frequencies};
     std::string suggestion;
     std::uint64_t revision = 0;
     std::uint64_t saved_revision = 0;
@@ -97,21 +94,32 @@ struct Editor {
     }
 
     void predict() {
-        if (gtk_text_buffer_get_has_selection(buffer)) {
+        const GtkTextIter end = cursor();
+        if (gtk_text_buffer_get_has_selection(buffer) ||
+            continues_word(gtk_text_iter_get_char(&end))) {
             set_suggestion({});
             return;
         }
-        GtkTextIter end = cursor();
-        if (!gtk_text_iter_ends_line(&end) && !gtk_text_iter_is_end(&end)) {
-            set_suggestion({});
-            return;
-        }
+
         GtkTextIter start = end;
-        for (int count = 0; count < 8 && !gtk_text_iter_starts_line(&start); ++count)
-            gtk_text_iter_backward_char(&start);
+        GtkTextIter previous = start;
+        while (gtk_text_iter_backward_char(&previous) &&
+               continues_word(gtk_text_iter_get_char(&previous)))
+            start = previous;
+        if (gtk_text_iter_get_offset(&end) - gtk_text_iter_get_offset(&start) < 3) {
+            set_suggestion({});
+            return;
+        }
+
+        GtkTextIter document_start, document_end;
+        gtk_text_buffer_get_bounds(buffer, &document_start, &document_end);
         gchar* prefix = gtk_text_buffer_get_text(buffer, &start, &end, TRUE);
-        set_suggestion(predictor.suggest(prefix));
+        gchar* before = gtk_text_buffer_get_text(buffer, &document_start, &start, TRUE);
+        gchar* after = gtk_text_buffer_get_text(buffer, &end, &document_end, TRUE);
+        set_suggestion(predictor.suffix(prefix, before, after));
         g_free(prefix);
+        g_free(before);
+        g_free(after);
     }
 
     void remember(std::vector<Snapshot>& stack, Snapshot state) {
@@ -202,21 +210,28 @@ struct Editor {
         pending_offset = offset;
     }
 
-    void accept(bool word_only) {
-        std::string accepted = suggestion;
-        std::string remainder;
-        if (word_only) {
-            const auto first = accepted.find_first_not_of(' ');
-            const auto boundary = accepted.find(' ', first);
-            if (boundary != std::string::npos) {
-                remainder = accepted.substr(boundary);
-                accepted.erase(boundary);
-            }
-        }
+    void accept() {
+        const auto accepted = suggestion;
+        const auto position = cursor();
+        GtkTextIter previous = position;
+        gtk_text_iter_backward_char(&previous);
+        const bool bold = has_style(previous, "bold");
+        const bool italic = has_style(previous, "italic");
+        const int offset = gtk_text_iter_get_offset(&position);
+
         gtk_text_buffer_begin_user_action(buffer);
-        gtk_text_buffer_insert_at_cursor(buffer, accepted.c_str(), -1);
+        GtkTextIter end = position;
+        gtk_text_buffer_insert(buffer, &end, accepted.c_str(), -1);
+        GtkTextIter start;
+        gtk_text_buffer_get_iter_at_offset(buffer, &start, offset);
+        gtk_text_buffer_remove_tag_by_name(buffer, "bold", &start, &end);
+        gtk_text_buffer_remove_tag_by_name(buffer, "italic", &start, &end);
+        if (bold)
+            gtk_text_buffer_apply_tag_by_name(buffer, "bold", &start, &end);
+        if (italic)
+            gtk_text_buffer_apply_tag_by_name(buffer, "italic", &start, &end);
         gtk_text_buffer_end_user_action(buffer);
-        set_suggestion(std::move(remainder));
+        set_suggestion({});
     }
 
     void show_error(const char* heading, const char* detail) {
@@ -353,11 +368,11 @@ struct Editor {
                 return TRUE;
             }
             if (modifiers == 0 && event->keyval == GDK_KEY_Tab) {
-                accept(false);
+                accept();
                 return TRUE;
             }
             if (modifiers == GDK_MOD1_MASK && event->keyval == GDK_KEY_Right) {
-                accept(true);
+                accept();
                 return TRUE;
             }
         }
@@ -370,7 +385,7 @@ struct Editor {
         auto position = cursor();
         auto* text_view = GTK_TEXT_VIEW(view);
         GdkRectangle caret, visible;
-        gtk_text_view_get_iter_location(text_view, &position, &caret);
+        gtk_text_view_get_cursor_locations(text_view, &position, &caret, nullptr);
         gtk_text_view_get_visible_rect(text_view, &visible);
         int x, y, clip_x, clip_y;
         gtk_text_view_buffer_to_window_coords(text_view, GTK_TEXT_WINDOW_WIDGET,
@@ -384,7 +399,26 @@ struct Editor {
         cairo_save(cr);
         cairo_rectangle(cr, clip_x, clip_y, visible.width, visible.height);
         cairo_clip(cr);
-        cairo_set_source_rgba(cr, color.red, color.green, color.blue, 0.45);
+        int width, height;
+        pango_layout_get_pixel_size(layout, &width, &height);
+        if ((!gtk_text_iter_ends_line(&position) && !gtk_text_iter_is_end(&position)) ||
+            x + width > clip_x + visible.width) {
+            constexpr int padding = 4;
+            x = std::clamp(x, clip_x + padding,
+                           std::max(clip_x + padding, clip_x + visible.width - width - padding));
+            y = y - height - 2 * padding >= clip_y ? y - height - padding : y + caret.height + padding;
+            gtk_style_context_save(style);
+            gtk_style_context_add_class(style, GTK_STYLE_CLASS_TOOLTIP);
+            gtk_render_background(style, cr, x - padding, y - padding,
+                                  width + 2 * padding, height + 2 * padding);
+            gtk_render_frame(style, cr, x - padding, y - padding,
+                             width + 2 * padding, height + 2 * padding);
+            gtk_style_context_get_color(style, gtk_widget_get_state_flags(view), &color);
+            gtk_style_context_restore(style);
+            cairo_set_source_rgba(cr, color.red, color.green, color.blue, 1);
+        } else {
+            cairo_set_source_rgba(cr, color.red, color.green, color.blue, 0.45);
+        }
         cairo_move_to(cr, x, y);
         pango_cairo_show_layout(cr, layout);
         cairo_restore(cr);
@@ -482,6 +516,7 @@ void activate(GtkApplication* app, gpointer) {
 
 }
 
+#ifndef STORYFLOW_EDITOR_TEST
 int main(int argc, char** argv) {
     auto* app = gtk_application_new("io.github.djshaji.StoryFlow", static_cast<GApplicationFlags>(0));
     g_signal_connect(app, "activate", G_CALLBACK(activate), nullptr);
@@ -489,3 +524,5 @@ int main(int argc, char** argv) {
     g_object_unref(app);
     return result;
 }
+
+#endif
